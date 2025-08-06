@@ -243,11 +243,19 @@ class DataPointProcessor:
                 file_validation_result = self._process_single_file(filename)
                 processing_summary["individual_results"][filename] = file_validation_result
                 
-                if file_validation_result.get("success", False):
+                # Считаем успешными только файлы со статусом "success"
+                if (file_validation_result.get("success", False) and 
+                    file_validation_result.get("validation_analysis", {}).get("validation_status") == "success"):
                     processing_summary["success_count"] += 1
                 else:
                     processing_summary["error_count"] += 1
-                    log_instance.error(f"File error: {filename} - {file_validation_result.get('error', 'unknown error')}")
+                    if file_validation_result.get("success", False):
+                        # Файл обработался, но валидация не прошла
+                        validation_status = file_validation_result.get("validation_analysis", {}).get("validation_status", "unknown")
+                        log_instance.error(f"File validation failed: {filename} - status: {validation_status}")
+                    else:
+                        # Общая ошибка обработки
+                        log_instance.error(f"File error: {filename} - {file_validation_result.get('error', 'unknown error')}")
             
             success_percentage = (processing_summary["success_count"] / processing_summary["total_processed"]) * 100 if processing_summary["total_processed"] > 0 else 0
             processing_summary["success_percentage"] = success_percentage
@@ -402,6 +410,7 @@ class DataPointProcessor:
         print(f"✅ Successful: {successful_files}")
         print(f"❌ With errors: {failed_files}")
         print(f"📈 Success rate: {success_rate:.1f}%")
+        print(f"\n💡 Note: Only files with status 'success' are counted as successful")
         
         individual_results = processing_results.get("individual_results", {})
         if individual_results:
@@ -415,27 +424,28 @@ class DataPointProcessor:
                     
                     if status == "success":
                         print(f"  ✅ {filename} ({instance_id}): All tests passed")
-                    elif status == "test_mismatch":
-                        print(f"  ⚠️  {filename} ({instance_id}): Some tests failed")
-                    elif status == "report_not_found":
-                        print(f"  📄 {filename} ({instance_id}): Report not found")
-                    elif status == "read_error":
-                        print(f"  🔍 {filename} ({instance_id}): Report read error")
                     else:
-                        print(f"  ❓ {filename} ({instance_id}): Unknown status")
+                        if status == "test_mismatch":
+                            print(f"  ❌ {filename} ({instance_id}): Test mismatch")
+                        elif status == "report_not_found":
+                            print(f"  ❌ {filename} ({instance_id}): Report not found")
+                        elif status == "read_error":
+                            print(f"  ❌ {filename} ({instance_id}): Report read error")
+                        else:
+                            print(f"  ❌ {filename} ({instance_id}): Unknown status")
                 else:
                     error_message = file_result.get("error", "unknown error")
                     print(f"  ❌ {filename}: {error_message}")
         
         # Final message
         if success_rate == 100.0:
-            print(f"\n🎉 All files processed successfully!")
+            print(f"\n🎉 All files validated successfully!")
         elif success_rate >= 80.0:
-            print(f"\n👍 Most files processed successfully")
+            print(f"\n👍 Most files validated successfully")
         elif success_rate >= 50.0:
-            print(f"\n⚖️  Half of files processed")
+            print(f"\n⚖️  Half of files validated successfully")
         else:
-            print(f"\n😞 Most files failed with errors")
+            print(f"\n😞 Most files failed validation")
 
 
 def main():
