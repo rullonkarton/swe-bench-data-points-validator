@@ -1,0 +1,281 @@
+name: Automated Data Validation Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'data_points/**'
+      - 'data_points_validator.py'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+
+env:
+  PYTHON_VERSION: '3.10'
+  VALIDATION_LOG_FILE: 'validation_results.log'
+  MAX_FILES_PER_BATCH: 50
+
+jobs:
+  data_validation_pipeline:
+    name: Execute data integrity validation workflow
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+
+    steps:
+      # ═══════════════════════════════════════════════════════════════════
+      # ENVIRONMENT SETUP AND PREPARATION
+      # ═══════════════════════════════════════════════════════════════════
+      
+      - name: Repository source code acquisition
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACTION_TOKEN_ACCESS }}
+          fetch-depth: 2  # Fetch current and previous commit for diff analysis
+
+      - name: Python runtime environment configuration
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: UV package manager installation and setup
+        run: |
+          # Download and install UV package manager
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          
+          # Add UV binary to system PATH
+          echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
+          
+          # Verify installation
+          export PATH="${HOME}/.cargo/bin:$PATH"
+          uv --version
+
+      - name: Project dependencies synchronization
+        run: |
+          # Sync all project dependencies using UV
+          uv sync --frozen
+          
+          # Verify critical packages are installed
+          uv pip list | grep -E "(pytest|docker|pathlib)"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # FILE CHANGE DETECTION AND ANALYSIS
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Analyze modified files in pull request
+        id: file_change_detector
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            console.log('Starting file change analysis...');
+            
+            const prNumber = context.payload.pull_request.number;
+            console.log(`Analyzing PR #${prNumber}`);
+            
+            // Fetch all changed files with pagination support
+            const fileChangeList = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100
+              }
+            );
+            
+            console.log(`Total changed files: ${fileChangeList.length}`);
+            
+            // Filter and process data point files
+            const relevantDataFiles = fileChangeList
+              .filter(file => file.status !== 'removed')  // Exclude deleted files
+              .map(fileEntry => fileEntry.filename)
+              .filter(filename => {
+                return filename.startsWith("data_points/") && 
+                       filename.endsWith(".json") &&
+                       !filename.includes('__pycache__');
+              })
+              .map(filename => filename.replace(/^data_points\//, "").replace(/\.json$/, ""))
+              .slice(0, ${{ env.MAX_FILES_PER_BATCH }});  // Limit batch size
+            
+            console.log(`Filtered data files: ${relevantDataFiles.join(', ')}`);
+            
+            // Set output for subsequent steps
+            core.setOutput("changed_data_files", relevantDataFiles.join(" "));
+            core.setOutput("file_count", relevantDataFiles.length.toString());
+            
+            return relevantDataFiles.length > 0 ? 'files_detected' : 'no_files';
+
+      # ═══════════════════════════════════════════════════════════════════
+      # VALIDATION EXECUTION AND MONITORING
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Data validation process execution
+        id: validation_runner
+        if: steps.file_change_detector.outputs.changed_data_files != ''
+        run: |
+          echo "════════════════════════════════════════════════════════════════"
+          echo "🚀 INITIATING DATA VALIDATION PIPELINE"
+          echo "════════════════════════════════════════════════════════════════"
+          echo "Target files: ${{ steps.file_change_detector.outputs.changed_data_files }}"
+          echo "File count: ${{ steps.file_change_detector.outputs.file_count }}"
+          echo "Validation log: ${{ env.VALIDATION_LOG_FILE }}"
+          echo "════════════════════════════════════════════════════════════════"
+          
+          # Set execution options for robust error handling
+          set -euo pipefail
+          
+          # Execute validation with comprehensive logging
+          python data_points_validator.py \
+            --data-dir data_points \
+            --files ${{ steps.file_change_detector.outputs.changed_data_files }} \
+            --verbose \
+            2>&1 | tee ${{ env.VALIDATION_LOG_FILE }}
+          
+          # Capture exit status for later analysis
+          echo "VALIDATION_EXIT_CODE=$?" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════════════
+      # RESULT PROCESSING AND REPORTING
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Validation success notification
+        if: success() && steps.validation_runner.conclusion == 'success'
+        run: |
+          echo "✅ VALIDATION PIPELINE COMPLETED SUCCESSFULLY"
+          echo "   📊 Processed files: ${{ steps.file_change_detector.outputs.file_count }}"
+          echo "   🎯 All data integrity checks passed"
+          echo "   📝 Detailed logs available in artifacts"
+
+      - name: Validation failure analysis and reporting
+        if: failure() && steps.validation_runner.conclusion == 'failure'
+        run: |
+          echo "❌ VALIDATION PIPELINE ENCOUNTERED ERRORS"
+          echo ""
+          echo "═══════════════ DETAILED ERROR ANALYSIS ═══════════════"
+          
+          # Display validation log if available
+          if [[ -f "${{ env.VALIDATION_LOG_FILE }}" ]]; then
+            echo "📋 Validation execution log:"
+            echo "────────────────────────────────────────────────────"
+            cat ${{ env.VALIDATION_LOG_FILE }}
+            echo "────────────────────────────────────────────────────"
+          else
+            echo "⚠️  Validation log file not found - execution may have failed early"
+          fi
+          
+          echo "══════════════════════════════════════════════════════"
+          echo "💡 Next steps:"
+          echo "   1. Review error messages above"
+          echo "   2. Fix data integrity issues"
+          echo "   3. Re-run validation locally"
+          echo "   4. Push corrected changes"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # PULL REQUEST INTERACTION AND FEEDBACK
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Post success feedback to pull request
+        if: success() && github.event_name == 'pull_request' && steps.validation_runner.conclusion == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fileCount = '${{ steps.file_change_detector.outputs.file_count }}';
+            const changedFiles = '${{ steps.file_change_detector.outputs.changed_data_files }}';
+            
+            const successMessage = `## ✅ Data Validation: PASSED
+            
+            **Validation Summary:**
+            - 📊 **Files processed:** ${fileCount}
+            - 🎯 **Status:** All integrity checks completed successfully
+            - ⏱️ **Pipeline:** Automated validation workflow
+            
+            **Validated files:**
+            \`\`\`
+            ${changedFiles.split(' ').join('\n')}
+            \`\`\`
+            
+            🚀 **Ready for merge** - All data quality requirements satisfied.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: successMessage
+            });
+
+      - name: Post failure feedback to pull request
+        if: failure() && github.event_name == 'pull_request' && steps.validation_runner.conclusion == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fileCount = '${{ steps.file_change_detector.outputs.file_count }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            const failureMessage = `## ❌ Data Validation: FAILED
+            
+            **Validation Summary:**
+            - 📊 **Files processed:** ${fileCount}
+            - 🚨 **Status:** Data integrity issues detected
+            - ⏱️ **Pipeline:** Automated validation workflow
+            
+            **Required Actions:**
+            1. 🔍 Review the [detailed workflow logs](${runUrl})
+            2. 🛠️ Fix identified data integrity issues
+            3. 🧪 Test corrections locally using: \`python data_points_validator.py --files <filename>\`
+            4. 📤 Push corrected changes to re-trigger validation
+            
+            **Need Help?**
+            - Check the validation logs for specific error details
+            - Ensure all required fields are present in data files
+            - Verify JSON syntax and structure compliance
+            
+            ⚠️ **Merge blocked** until all validation checks pass.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: failureMessage
+            });
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ARTIFACT COLLECTION AND CLEANUP
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Archive validation artifacts
+        if: always() && steps.validation_runner.outputs.conclusion != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs-${{ github.run_id }}
+          path: |
+            ${{ env.VALIDATION_LOG_FILE }}
+            *.jsonl
+            logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Workflow cleanup and finalization
+        if: always()
+        run: |
+          echo "🧹 Performing workflow cleanup..."
+          
+          # Clean up temporary files
+          rm -f *.jsonl validation_*.log || true
+          
+          # Display final status
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ Workflow completed successfully"
+          else
+            echo "❌ Workflow completed with issues"
+          fi
+          
+          echo "📊 Workflow statistics:"
+          echo "   - Files analyzed: ${{ steps.file_change_detector.outputs.file_count || 0 }}"
+          echo "   - Duration: ${{ job.duration || 'N/A' }}"
+          echo "   - Status: ${{ job.status }}" 

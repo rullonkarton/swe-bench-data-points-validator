@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  data-quality-checker:
+    build: .
+    container_name: quality-control-service
+    privileged: true  # Privileged mode for Docker-in-Docker
+    stdin_open: true  # Interactive mode
+    tty: true
+    working_dir: /workspace
+    environment:
+      - PYTHON_PATH=/workspace
+    volumes:
+      # Mount current directory for development
+      - .:/workspace
+      # Mount Docker socket for running evaluation harness
+      - /var/run/docker.sock:/var/run/docker.sock 
